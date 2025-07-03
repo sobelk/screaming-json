@@ -15,8 +15,16 @@
     "parser",
     "typescript"
   ],
-  "author": "",
+  "author": "sobelk",
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sobelk/screaming-json.git"
+  },
+  "homepage": "https://github.com/sobelk/screaming-json",
+  "bugs": {
+    "url": "https://github.com/sobelk/screaming-json/issues"
+  },
   "devDependencies": {
     "@types/node": "^20.11.24",
     "typescript": "^5.3.3",
