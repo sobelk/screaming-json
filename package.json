@@ -1,0 +1,25 @@
+{
+  "name": "screaming-json",
+  "version": "0.1.0",
+  "description": "A streaming JSON parser",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "json",
+    "streaming",
+    "parser",
+    "typescript"
+  ],
+  "author": "",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "typescript": "^5.3.3",
+    "vitest": "^1.3.1"
+  }
+}
