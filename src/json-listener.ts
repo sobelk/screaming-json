@@ -1,4 +1,4 @@
-import { StreamingJSONParser } from "./streaming-json";
+import { StreamingJSONParser } from "./state-machine";
 
 export type JSONPath = (string | number)[];
 export type ItemCallback = (path: JSONPath, item: any) => void;
