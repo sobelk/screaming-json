@@ -4,6 +4,17 @@
   "description": "A streaming JSON parser",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
   "scripts": {
     "build": "tsc",
     "test": "vitest",
@@ -16,7 +27,7 @@
     "typescript"
   ],
   "author": "sobelk",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/sobelk/screaming-json.git"
@@ -24,6 +35,9 @@
   "homepage": "https://github.com/sobelk/screaming-json",
   "bugs": {
     "url": "https://github.com/sobelk/screaming-json/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@types/node": "^20.11.24",
