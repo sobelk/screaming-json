@@ -552,11 +552,64 @@ export class StreamingJSONParser {
         this.numberBuffer = "";
       }
 
+      // Per-character accumulation: these states accept multiple characters
+      // (e.g. continued string contents, digits in a number, hex digits in a
+      // unicode escape). They must run on every character they appear on,
+      // including same-state continuations.
       switch (this.state) {
-        case "open":
-          // The initial state or whitespace following it.
+        case "string-char":
+          this.stringBuffer += char;
+          if (this.stateMachine.isInKey) {
+            this.currentKey += char;
+          }
           break;
 
+        case "string-escaped-char":
+          this.stringBuffer += ESCAPE_MAP[char];
+          break;
+
+        case "string-escape-unicode-2":
+        case "string-escape-unicode-3":
+        case "string-escape-unicode-4":
+          this.unicodeBuffer += char;
+          break;
+
+        case "string-escape-unicode-close":
+          this.unicodeBuffer += char;
+          this.stringBuffer += String.fromCodePoint(
+            parseInt(this.unicodeBuffer, 16)
+          );
+          this.unicodeBuffer = "";
+          break;
+
+        case "number-integer":
+          // First entry into number-integer yields open-number; subsequent
+          // digits in the same state just append.
+          if (!this.numberBuffer) {
+            yield { type: "open-number", path: [...this.path] };
+          }
+          this.numberBuffer += char;
+          break;
+
+        case "number-decimal":
+        case "number-exponent":
+        case "number-exponent-sign":
+        case "number-exponent-digit":
+        case "number-decimal-digit":
+          this.numberBuffer += char;
+          break;
+      }
+
+      // Transition-only events: yields and path mutations that must fire
+      // exactly once when the state is *entered*. The state machine returns
+      // the same state for whitespace continuations (e.g. `, ` keeps state
+      // at "object-comma"); without this guard we would pop/push the path
+      // multiple times and corrupt the event stream.
+      if (this.state === previousState) {
+        continue;
+      }
+
+      switch (this.state) {
         case "object-open":
           // For consistency with other open events, do not include a
           // new key.
@@ -594,43 +647,7 @@ export class StreamingJSONParser {
           }
           break;
 
-        case "string-char":
-          // Do not yield immediately. Wait until a state transition or
-          // the end of a chunk.
-          this.stringBuffer += char;
-          if (this.stateMachine.isInKey) {
-            this.currentKey += char;
-          }
-          break;
-
-        case "string-escape":
-          // Wait until the next character to add it to the buffer. Do not
-          // yield any invalid strings.
-          break;
-
-        case "string-escaped-char":
-          this.stringBuffer += ESCAPE_MAP[char];
-          break;
-
-        case "string-escape-unicode-open":
-          // This is the 'u' character.
-          break;
-        case "string-escape-unicode-2":
-        case "string-escape-unicode-3":
-        case "string-escape-unicode-4":
-          // Buffer the Unicode code point until it is complete.
-          this.unicodeBuffer += char;
-          break;
-        case "string-escape-unicode-close":
-          this.unicodeBuffer += char;
-          this.stringBuffer += String.fromCodePoint(
-            parseInt(this.unicodeBuffer, 16)
-          );
-          this.unicodeBuffer = "";
-          break;
-
         case "key-close":
-          // Yield one event for a batch of characters.
           yield {
             type: "append-key",
             path: [...this.path],
@@ -657,34 +674,8 @@ export class StreamingJSONParser {
           break;
 
         case "number-sign":
-          // Can only be the first character of a number.
           this.numberBuffer += char;
           yield { type: "open-number", path: [...this.path] };
-          break;
-
-        case "number-integer":
-          // May the first character of a number or a middle character.
-          if (!this.numberBuffer) {
-            yield { type: "open-number", path: [...this.path] };
-          }
-
-          // Like strings, only yield numbers at the end of a chunk or
-          // when the number is complete.
-          this.numberBuffer += char;
-          break;
-
-        case "number-decimal":
-        case "number-exponent":
-        case "number-exponent-sign":
-          // These can neither start nor end a number, nor alter the value
-          // of the number.
-          this.numberBuffer += char;
-          break;
-
-        case "number-exponent-digit":
-        case "number-decimal-digit":
-          // These leave the number in a valid state.
-          this.numberBuffer += char;
           break;
 
         case "false-open":
@@ -693,10 +684,6 @@ export class StreamingJSONParser {
             path: [...this.path],
             value: false,
           };
-          break;
-        case "false-2":
-        case "false-3":
-        case "false-4":
           break;
         case "false-close":
           yield {
@@ -713,9 +700,6 @@ export class StreamingJSONParser {
             value: true,
           };
           break;
-        case "true-2":
-        case "true-3":
-          break;
         case "true-close":
           yield {
             type: "close-boolean",
@@ -726,9 +710,6 @@ export class StreamingJSONParser {
 
         case "null-open":
           yield { type: "open-null", path: [...this.path] };
-          break;
-        case "null-2":
-        case "null-3":
           break;
         case "null-close":
           yield { type: "close-null", path: [...this.path] };

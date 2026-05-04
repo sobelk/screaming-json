@@ -81,6 +81,40 @@ describe("JSONListener", () => {
         weight: 6,
       });
     });
+
+    it("should trigger with whitespace between object members", () => {
+      const callback = vi.fn();
+      listener.onItem(["expenses"], callback);
+
+      listener.write(
+        '{"expenses": [{"_index": 0, "occurredAt": "2026-04-04", "description": "Spoonbill & Sugartown Books, Inc. - Book purchase", "category": "supplies", "amountCents": 3266}]}'
+      );
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith(["expenses", 0], {
+        _index: 0,
+        occurredAt: "2026-04-04",
+        description:
+          "Spoonbill & Sugartown Books, Inc. - Book purchase",
+        category: "supplies",
+        amountCents: 3266,
+      });
+    });
+
+    it("should trigger with whitespace between array items", () => {
+      const callback = vi.fn();
+      listener.onItem(["elements"], callback);
+
+      listener.write('{"elements":[{"name":"Rabbit"}, {"name":"Cat"}]}');
+
+      expect(callback).toHaveBeenCalledTimes(2);
+      expect(callback).toHaveBeenNthCalledWith(1, ["elements", 0], {
+        name: "Rabbit",
+      });
+      expect(callback).toHaveBeenNthCalledWith(2, ["elements", 1], {
+        name: "Cat",
+      });
+    });
   });
 
   describe("onPartial", () => {
