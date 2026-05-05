@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { JSONStateMachine } from "../streaming-json";
+import { JSONStateMachine } from "../state-machine";
 
 function write(str: string, terminate = false) {
   const tokenizer = new JSONStateMachine();

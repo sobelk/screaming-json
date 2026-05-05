@@ -325,4 +325,278 @@ describe("JSONListener", () => {
       // The actual memory efficiency would need to be verified in implementation
     });
   });
+
+  describe("path matching discrimination", () => {
+    it("should not match a numeric listener segment against a string key", () => {
+      // The listener path declares a number `0` at index 0, but the JSON
+      // exposes a string key "0". These should be distinct.
+      const callback = vi.fn();
+      listener.onComplete([0, "name"], callback);
+
+      listener.write('{"0":{"name":"value"}}');
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it("should not match a string listener segment against an array index", () => {
+      const callback = vi.fn();
+      // Listener wants ["a","b"] but the structure under "a" is an array,
+      // so the parser emits paths like ["a", 0] — string "b" must not match
+      // numeric 0.
+      listener.onComplete(["a", "b"], callback);
+
+      listener.write('{"a":["x","y"]}');
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it("should not fire the wildcard listener on object keys", () => {
+      // ANY_INDEX is an array wildcard — it should never resolve to a
+      // string key.
+      const callback = vi.fn();
+      listener.onComplete([-1], callback);
+
+      listener.write('{"a":1,"b":2}');
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it("should not fire ['items', -1] when items is an object", () => {
+      const callback = vi.fn();
+      listener.onComplete(["items", -1], callback);
+
+      listener.write('{"items":{"a":1,"b":2}}');
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it("should not fire onItem for sibling arrays at the wrong path", () => {
+      const callback = vi.fn();
+      listener.onItem(["users"], callback);
+
+      listener.write('{"posts":[{"id":1},{"id":2}]}');
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it("should not fire onPartial for events outside the registered subtree", () => {
+      const callback = vi.fn();
+      listener.onPartial(["users"], callback);
+
+      listener.write('{"posts":[1,2,3],"meta":{"k":"v"}}');
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("onComplete on primitive values", () => {
+    it("should fire with a numeric value at a nested path", () => {
+      const callback = vi.fn();
+      listener.onComplete(["x"], callback);
+
+      listener.write('{"x":-42}');
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith(["x"], -42);
+    });
+
+    it("should fire with zero", () => {
+      const callback = vi.fn();
+      listener.onComplete(["x"], callback);
+
+      listener.write('{"x":0}');
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith(["x"], 0);
+    });
+  });
+
+  describe("onItem with primitive arrays", () => {
+    it("should fire for each numeric element", () => {
+      const callback = vi.fn();
+      listener.onItem(["nums"], callback);
+
+      listener.write('{"nums":[1,2,3]}');
+
+      expect(callback).toHaveBeenCalledTimes(3);
+      expect(callback).toHaveBeenNthCalledWith(1, ["nums", 0], 1);
+      expect(callback).toHaveBeenNthCalledWith(2, ["nums", 1], 2);
+      expect(callback).toHaveBeenNthCalledWith(3, ["nums", 2], 3);
+    });
+
+    it("should fire for each string element", () => {
+      const callback = vi.fn();
+      listener.onItem(["tags"], callback);
+
+      listener.write('{"tags":["a","b","c"]}');
+
+      expect(callback).toHaveBeenCalledTimes(3);
+      expect(callback).toHaveBeenNthCalledWith(1, ["tags", 0], "a");
+      expect(callback).toHaveBeenNthCalledWith(2, ["tags", 1], "b");
+      expect(callback).toHaveBeenNthCalledWith(3, ["tags", 2], "c");
+    });
+
+    it("should fire for booleans and null", () => {
+      const callback = vi.fn();
+      listener.onItem(["flags"], callback);
+
+      listener.write('{"flags":[true,false,null]}');
+
+      expect(callback).toHaveBeenCalledTimes(3);
+      expect(callback).toHaveBeenNthCalledWith(1, ["flags", 0], true);
+      expect(callback).toHaveBeenNthCalledWith(2, ["flags", 1], false);
+      expect(callback).toHaveBeenNthCalledWith(3, ["flags", 2], null);
+    });
+  });
+
+  describe("onComplete on empty containers", () => {
+    it("should fire with an empty object value", () => {
+      const callback = vi.fn();
+      listener.onComplete(["x"], callback);
+
+      listener.write('{"x":{}}');
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith(["x"], {});
+    });
+
+    it("should fire with an empty array value", () => {
+      const callback = vi.fn();
+      listener.onComplete(["x"], callback);
+
+      listener.write('{"x":[]}');
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith(["x"], []);
+    });
+
+    it("should fire on the root for an empty object", () => {
+      const callback = vi.fn();
+      listener.onComplete([], callback);
+
+      listener.write("{}");
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith([], {});
+    });
+
+    it("should fire on the root for an empty array", () => {
+      const callback = vi.fn();
+      listener.onComplete([], callback);
+
+      listener.write("[]");
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith([], []);
+    });
+  });
+
+  describe("onPartial against a primitive value", () => {
+    it("should report incremental string growth at the registered path", () => {
+      const callback = vi.fn();
+      listener.onPartial(["msg"], callback);
+
+      listener.write('{"msg":"hel');
+      expect(callback).toHaveBeenCalledWith(["msg"], "hel");
+
+      listener.write('lo"}');
+      expect(callback).toHaveBeenCalledWith(["msg"], "hello");
+    });
+
+    it("should report the final number value at the registered path", () => {
+      const callback = vi.fn();
+      listener.onPartial(["score"], callback);
+
+      listener.write('{"score":42}');
+
+      expect(callback).toHaveBeenCalledWith(["score"], 42);
+    });
+  });
+
+  describe("listener stress", () => {
+    it("should support multiple wildcards in a single path", () => {
+      const callback = vi.fn();
+      listener.onComplete(["users", -1, "items", -1, "name"], callback);
+
+      listener.write(
+        '{"users":[' +
+          '{"items":[{"name":"a"},{"name":"b"}]},' +
+          '{"items":[{"name":"c"}]}' +
+          "]}"
+      );
+
+      expect(callback).toHaveBeenCalledTimes(3);
+      expect(callback).toHaveBeenCalledWith(
+        ["users", 0, "items", 0, "name"],
+        "a"
+      );
+      expect(callback).toHaveBeenCalledWith(
+        ["users", 0, "items", 1, "name"],
+        "b"
+      );
+      expect(callback).toHaveBeenCalledWith(
+        ["users", 1, "items", 0, "name"],
+        "c"
+      );
+    });
+
+    it("should fire each callback when the same path is registered twice", () => {
+      const callbackA = vi.fn();
+      const callbackB = vi.fn();
+      listener.onComplete(["x"], callbackA);
+      listener.onComplete(["x"], callbackB);
+
+      listener.write('{"x":42}');
+
+      expect(callbackA).toHaveBeenCalledTimes(1);
+      expect(callbackB).toHaveBeenCalledTimes(1);
+      expect(callbackA).toHaveBeenCalledWith(["x"], 42);
+      expect(callbackB).toHaveBeenCalledWith(["x"], 42);
+    });
+
+    it("should fire onComplete on a root primitive number", () => {
+      const callback = vi.fn();
+      listener.onComplete([], callback);
+
+      listener.write("42", true);
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith([], 42);
+    });
+
+    it("should fire onComplete on a root primitive string", () => {
+      const callback = vi.fn();
+      listener.onComplete([], callback);
+
+      listener.write('"hello"');
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith([], "hello");
+    });
+
+    it("should fire onItem at the root for a top-level array", () => {
+      const callback = vi.fn();
+      listener.onItem([], callback);
+
+      listener.write("[10,20,30]");
+
+      expect(callback).toHaveBeenCalledTimes(3);
+      expect(callback).toHaveBeenNthCalledWith(1, [0], 10);
+      expect(callback).toHaveBeenNthCalledWith(2, [1], 20);
+      expect(callback).toHaveBeenNthCalledWith(3, [2], 30);
+    });
+
+    it("should fire onPartial at the root as the JSON grows", () => {
+      const callback = vi.fn();
+      listener.onPartial([], callback);
+
+      listener.write('{"x":1');
+      // After this chunk we should have observed an intermediate state
+      // containing x=1.
+      expect(callback).toHaveBeenCalledWith([], { x: 1 });
+
+      listener.write(',"y":2}');
+      expect(callback).toHaveBeenCalledWith([], { x: 1, y: 2 });
+    });
+  });
 });

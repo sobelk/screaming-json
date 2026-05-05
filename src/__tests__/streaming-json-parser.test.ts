@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { JSONStateMachine, StreamingJSONParser } from "../streaming-json";
+import { JSONStateMachine, StreamingJSONParser } from "../state-machine";
 
 // Need to define the event type since it's not exported
 type StreamingJSONEvent =
@@ -476,6 +476,417 @@ describe("StreamingJSONParser", () => {
       // Find the close-number event
       const closeNumberEvent = events.find((e) => e.type === "close-number");
       expect(closeNumberEvent).toBeDefined();
+    });
+  });
+
+  describe("number coverage", () => {
+    const lastSetNumber = (events: StreamingJSONEvent[]) =>
+      events.filter((e) => e.type === "set-number").pop() as
+        | { type: "set-number"; path: (string | number)[]; value: number }
+        | undefined;
+
+    it("should parse zero as a root value", () => {
+      const events = collectEvents("0", true);
+      expect(lastSetNumber(events)?.value).toBe(0);
+    });
+
+    it("should parse negative zero as a root value", () => {
+      const events = collectEvents("-0", true);
+      const value = lastSetNumber(events)?.value;
+      expect(Object.is(value, -0)).toBe(true);
+    });
+
+    it("should parse a negative integer as a root value", () => {
+      const events = collectEvents("-5", true);
+      expect(lastSetNumber(events)?.value).toBe(-5);
+    });
+
+    it("should parse a negative decimal with negative exponent", () => {
+      const events = collectEvents("-1.5e-3", true);
+      expect(lastSetNumber(events)?.value).toBe(-0.0015);
+    });
+
+    it("should parse zero as an object value", () => {
+      const events = collectEvents('{"x":0}');
+      const setNumberEvents = events.filter((e) => e.type === "set-number") as {
+        type: "set-number";
+        path: (string | number)[];
+        value: number;
+      }[];
+      expect(setNumberEvents.length).toBeGreaterThan(0);
+      expect(setNumberEvents[setNumberEvents.length - 1].value).toBe(0);
+      expect(setNumberEvents[setNumberEvents.length - 1].path).toEqual(["x"]);
+    });
+
+    it("should parse a negative number as an object value", () => {
+      const events = collectEvents('{"x":-42}');
+      const setNumberEvents = events.filter((e) => e.type === "set-number") as {
+        type: "set-number";
+        path: (string | number)[];
+        value: number;
+      }[];
+      expect(setNumberEvents[setNumberEvents.length - 1].value).toBe(-42);
+      expect(setNumberEvents[setNumberEvents.length - 1].path).toEqual(["x"]);
+    });
+
+    it("should parse negative numbers inside an array with correct indices", () => {
+      const events = collectEvents("[-1,-2,-3]");
+      const setNumberEvents = events.filter((e) => e.type === "set-number") as {
+        type: "set-number";
+        path: (string | number)[];
+        value: number;
+      }[];
+      // Streaming numbers emit interim set-number events while digits arrive.
+      // The final set-number per index is what callers should observe.
+      const lastByIndex = new Map<number, number>();
+      for (const e of setNumberEvents) {
+        lastByIndex.set(e.path[0] as number, e.value);
+      }
+      expect(lastByIndex.get(0)).toBe(-1);
+      expect(lastByIndex.get(1)).toBe(-2);
+      expect(lastByIndex.get(2)).toBe(-3);
+    });
+
+    it("should pin current lenient handling of leading zero", () => {
+      // The state machine has a TODO for proper zero handling. Today the
+      // `[-0-9]` regex accepts a leading `0` and continues collecting digits,
+      // so `01` parses as 1. This test pins the current behavior; if the
+      // TODO is addressed it should be updated to assert a thrown error.
+      const events = collectEvents("01", true);
+      expect(lastSetNumber(events)?.value).toBe(1);
+    });
+  });
+
+  describe("key escapes", () => {
+    it("should decode an escape sequence inside an object key", () => {
+      // JSON: {"a\nb":1} — key has a literal backslash-n escape.
+      const events = collectEvents('{"a\\nb":1}');
+      const closeKey = events.find((e) => e.type === "close-key") as
+        | { type: "close-key"; path: (string | number)[]; key: string }
+        | undefined;
+      expect(closeKey?.key).toBe("a\nb");
+      expect(closeKey?.path).toEqual(["a\nb"]);
+
+      // Subsequent value events should be tagged with the decoded key.
+      const setNumber = events.find((e) => e.type === "set-number") as
+        | { type: "set-number"; path: (string | number)[]; value: number }
+        | undefined;
+      expect(setNumber?.path).toEqual(["a\nb"]);
+    });
+
+    it("should decode an escaped quote inside an object key", () => {
+      // JSON: {"a\"b":1}
+      const events = collectEvents('{"a\\"b":1}');
+      const closeKey = events.find((e) => e.type === "close-key") as
+        | { type: "close-key"; path: (string | number)[]; key: string }
+        | undefined;
+      expect(closeKey?.key).toBe('a"b');
+    });
+
+    it("should decode a unicode escape inside an object key", () => {
+      // JSON: {"é":1}  →  key is "é"
+      const events = collectEvents('{"\\u00e9":1}');
+      const closeKey = events.find((e) => e.type === "close-key") as
+        | { type: "close-key"; path: (string | number)[]; key: string }
+        | undefined;
+      expect(closeKey?.key).toBe("é");
+      expect(closeKey?.path).toEqual(["é"]);
+    });
+
+    it("should decode mixed escapes in a key", () => {
+      // JSON: {"aA\nb":1} → key is "aA\nb"
+      const events = collectEvents('{"a\\u0041\\nb":1}');
+      const closeKey = events.find((e) => e.type === "close-key") as
+        | { type: "close-key"; path: (string | number)[]; key: string }
+        | undefined;
+      expect(closeKey?.key).toBe("aA\nb");
+    });
+
+    it("should handle a key whose escape is split across chunks", () => {
+      parser = new StreamingJSONParser();
+      const events: StreamingJSONEvent[] = [];
+      // Split inside the unicode escape: `{"\u00` | `e9":1}`
+      for (const e of parser.write('{"\\u00')) events.push(e as StreamingJSONEvent);
+      for (const e of parser.write('e9":1}', true)) events.push(e as StreamingJSONEvent);
+
+      const closeKey = events.find((e) => e.type === "close-key") as
+        | { type: "close-key"; path: (string | number)[]; key: string }
+        | undefined;
+      expect(closeKey?.key).toBe("é");
+      expect(closeKey?.path).toEqual(["é"]);
+    });
+  });
+
+  describe("empty strings and whitespace", () => {
+    it("should emit close-string for an empty root string", () => {
+      const events = collectEvents('""');
+      const types = events.map((e) => e.type);
+      expect(types[0]).toBe("open-string");
+      expect(types[types.length - 1]).toBe("close-string");
+
+      // Any append-string events that fire must carry an empty delta.
+      const appends = events.filter((e) => e.type === "append-string") as {
+        type: "append-string";
+        path: (string | number)[];
+        delta: string;
+      }[];
+      const content = appends.map((e) => e.delta).join("");
+      expect(content).toBe("");
+    });
+
+    it("should parse an object whose value is the empty string", () => {
+      const events = collectEvents('{"x":""}');
+      const closeStringEvents = events.filter((e) => e.type === "close-string");
+      expect(closeStringEvents).toHaveLength(1);
+      expect(closeStringEvents[0].path).toEqual(["x"]);
+
+      const appends = events.filter((e) => e.type === "append-string") as {
+        type: "append-string";
+        path: (string | number)[];
+        delta: string;
+      }[];
+      const content = appends
+        .filter((e) => e.path[0] === "x")
+        .map((e) => e.delta)
+        .join("");
+      expect(content).toBe("");
+    });
+
+    it("should accept whitespace around colons and commas", () => {
+      const events = collectEvents('{ "a" : 1 , "b" : 2 }');
+      const setNumbers = events.filter((e) => e.type === "set-number") as {
+        type: "set-number";
+        path: (string | number)[];
+        value: number;
+      }[];
+      const byKey = new Map<string, number>();
+      for (const e of setNumbers) {
+        byKey.set(e.path[0] as string, e.value);
+      }
+      expect(byKey.get("a")).toBe(1);
+      expect(byKey.get("b")).toBe(2);
+    });
+
+    it("should accept multiline JSON with newlines and tabs", () => {
+      const json = `{
+\t"name": "John",
+\t"items": [
+\t\t1,
+\t\t2
+\t]
+}`;
+      const events = collectEvents(json);
+      const closeKeys = events.filter((e) => e.type === "close-key") as {
+        type: "close-key";
+        path: (string | number)[];
+        key: string;
+      }[];
+      expect(closeKeys.map((e) => e.key)).toEqual(["name", "items"]);
+
+      const setNumbers = events.filter((e) => e.type === "set-number") as {
+        type: "set-number";
+        path: (string | number)[];
+        value: number;
+      }[];
+      // Keep only the final set-number per array index (streaming may emit
+      // interim values as digits arrive).
+      const finalByIndex = new Map<number, number>();
+      for (const e of setNumbers) {
+        finalByIndex.set(e.path[1] as number, e.value);
+      }
+      expect(finalByIndex.get(0)).toBe(1);
+      expect(finalByIndex.get(1)).toBe(2);
+    });
+
+    it("should accept leading whitespace before the root value", () => {
+      const events = collectEvents('   {"x":1}');
+      expect(events[0]).toEqual({ type: "open-object", path: [] });
+    });
+
+    it("should accept trailing whitespace after a closed root", () => {
+      // Trailing whitespace is valid JSON. Termination should succeed.
+      expect(() => collectEvents("{}   ", true)).not.toThrow();
+    });
+  });
+
+  describe("streaming split edge cases", () => {
+    const collectAcross = (
+      chunks: { str: string; terminate?: boolean }[]
+    ): StreamingJSONEvent[] => {
+      parser = new StreamingJSONParser();
+      const events: StreamingJSONEvent[] = [];
+      for (const c of chunks) {
+        for (const e of parser.write(c.str, c.terminate ?? false)) {
+          events.push(e as StreamingJSONEvent);
+        }
+      }
+      return events;
+    };
+
+    it("should resume parsing `true` across a chunk split", () => {
+      const events = collectAcross([{ str: "tr" }, { str: "ue" }]);
+      expect(events).toEqual([
+        { type: "open-boolean", path: [], value: true },
+        { type: "close-boolean", path: [], value: true },
+      ]);
+    });
+
+    it("should resume parsing `false` across a chunk split", () => {
+      const events = collectAcross([{ str: "fa" }, { str: "lse" }]);
+      expect(events).toEqual([
+        { type: "open-boolean", path: [], value: false },
+        { type: "close-boolean", path: [], value: false },
+      ]);
+    });
+
+    it("should resume parsing `null` across a chunk split", () => {
+      const events = collectAcross([{ str: "nu" }, { str: "ll" }]);
+      expect(events).toEqual([
+        { type: "open-null", path: [] },
+        { type: "close-null", path: [] },
+      ]);
+    });
+
+    it("should accumulate digits across a chunk split", () => {
+      const events = collectAcross([
+        { str: "12" },
+        { str: "34", terminate: true },
+      ]);
+      const setNumbers = events.filter((e) => e.type === "set-number") as {
+        type: "set-number";
+        path: (string | number)[];
+        value: number;
+      }[];
+      // The parser may emit an interim set-number per chunk (12 then 1234);
+      // the final value is what matters.
+      expect(setNumbers[setNumbers.length - 1].value).toBe(1234);
+    });
+
+    it("should accept an empty write between meaningful chunks", () => {
+      const events = collectAcross([
+        { str: '{"x":' },
+        { str: "" },
+        { str: "1}" },
+      ]);
+      const setNumber = events.find((e) => e.type === "set-number") as
+        | { type: "set-number"; path: (string | number)[]; value: number }
+        | undefined;
+      expect(setNumber?.value).toBe(1);
+      expect(setNumber?.path).toEqual(["x"]);
+    });
+  });
+
+  describe("post-root data", () => {
+    it("should throw on a second value after a closed root", () => {
+      // `{}{}` — a second value follows a complete root with no separator.
+      // The state machine has no concept of multiple top-level values.
+      expect(() => collectEvents("{}{}", true)).toThrow();
+    });
+
+    it("should throw on garbage after a closed root", () => {
+      expect(() => collectEvents("{}garbage", true)).toThrow();
+    });
+  });
+
+  describe("spec edge cases", () => {
+    it("should decode a surrogate-pair unicode escape", () => {
+      // 😀 → 😀 (U+1F600)
+      const events = collectEvents('"\\uD83D\\uDE00"');
+      const appends = events.filter((e) => e.type === "append-string") as {
+        type: "append-string";
+        path: (string | number)[];
+        delta: string;
+      }[];
+      const content = appends.map((e) => e.delta).join("");
+      expect(content).toBe("😀");
+    });
+
+    it("should reject a bare minus sign as a number", () => {
+      // Per JSON spec, `-` MUST be followed by a digit. Without one the
+      // parser should refuse to terminate.
+      expect(() => collectEvents("-", true)).toThrow();
+    });
+
+    it("should reject a number with a trailing decimal point", () => {
+      expect(() => collectEvents("5.", true)).toThrow();
+    });
+
+    it("should reject a number with no leading digit", () => {
+      expect(() => collectEvents(".5", true)).toThrow();
+    });
+
+    it("should reject a leading positive sign on a number", () => {
+      expect(() => collectEvents("+5", true)).toThrow();
+    });
+
+    it("should parse an empty string as an object key", () => {
+      const events = collectEvents('{"":1}');
+      const closeKey = events.find((e) => e.type === "close-key") as
+        | { type: "close-key"; path: (string | number)[]; key: string }
+        | undefined;
+      expect(closeKey?.key).toBe("");
+      expect(closeKey?.path).toEqual([""]);
+
+      const setNumber = events.find((e) => e.type === "set-number") as
+        | { type: "set-number"; path: (string | number)[]; value: number }
+        | undefined;
+      expect(setNumber?.path).toEqual([""]);
+      expect(setNumber?.value).toBe(1);
+    });
+
+    it("should treat a numeric-looking key as a string", () => {
+      // The JSON object key "123" must stay a string in the path; arrays
+      // use numeric indices.
+      const events = collectEvents('{"123":"value"}');
+      const closeKey = events.find((e) => e.type === "close-key") as
+        | { type: "close-key"; path: (string | number)[]; key: string }
+        | undefined;
+      expect(closeKey?.key).toBe("123");
+      expect(typeof closeKey?.path[0]).toBe("string");
+    });
+
+    it("should accept whitespace inside an empty object", () => {
+      expect(() => collectEvents("{ }", true)).not.toThrow();
+    });
+
+    it("should accept whitespace inside an empty array", () => {
+      expect(() => collectEvents("[ ]", true)).not.toThrow();
+    });
+
+    it("should handle consecutive `]]` closing nested arrays", () => {
+      const events = collectEvents("[[1,2]]");
+      const closeArrays = events.filter((e) => e.type === "close-array");
+      expect(closeArrays).toHaveLength(2);
+      expect(closeArrays[0].path).toEqual([0]);
+      expect(closeArrays[1].path).toEqual([]);
+    });
+
+    it("should handle `]}` closing an array inside an object", () => {
+      const events = collectEvents('{"xs":[1,2]}');
+      const closeArray = events.find((e) => e.type === "close-array");
+      const closeObject = events.find((e) => e.type === "close-object");
+      expect(closeArray?.path).toEqual(["xs"]);
+      expect(closeObject?.path).toEqual([]);
+    });
+
+    it("should handle `}]` closing an object inside an array", () => {
+      const events = collectEvents('[{"x":1}]');
+      const closeObject = events.find((e) => e.type === "close-object");
+      const closeArray = events.find((e) => e.type === "close-array");
+      expect(closeObject?.path).toEqual([0]);
+      expect(closeArray?.path).toEqual([]);
+    });
+
+    it("should reject writes after termination", () => {
+      parser = new StreamingJSONParser();
+      for (const _ of parser.write("{}", true)) {
+        // drain
+      }
+      expect(() => {
+        for (const _ of parser.write("x")) {
+          // drain
+        }
+      }).toThrow(/after termination/);
     });
   });
 });
