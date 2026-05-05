@@ -48,6 +48,41 @@ function isExactPath(left: JSONPath, right: JSONPath) {
   return left.every((value, index) => value === right[index]);
 }
 
+/**
+ * Returns true if a listener path (which may contain ANY_INDEX wildcards)
+ * matches a concrete event path of the same length, treating wildcards as
+ * matching any numeric segment.
+ */
+function matchesPath(listenerPath: JSONPath, eventPath: JSONPath) {
+  if (listenerPath.length !== eventPath.length) {
+    return false;
+  }
+
+  for (let i = 0; i < listenerPath.length; i++) {
+    if (listenerPath[i] === ANY_INDEX && typeof eventPath[i] === "number") {
+      continue;
+    }
+    if (listenerPath[i] !== eventPath[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Replaces ANY_INDEX wildcards in a listener path with the corresponding
+ * concrete segments from the event path, producing a path suitable for
+ * querying an accumulator and reporting back to the user.
+ */
+function resolveWildcards(
+  listenerPath: JSONPath,
+  eventPath: JSONPath
+): JSONPath {
+  return listenerPath.map((segment, i) =>
+    segment === ANY_INDEX ? eventPath[i] : segment
+  );
+}
+
 function queryAccumulator(
   accumulator: { path: JSONPath; partial: any },
   path: JSONPath
@@ -154,11 +189,23 @@ export class JSONListener {
   }
 
   private addAccumulator(path: JSONPath, partial: any) {
-    this.accumulators.push({ path, partial });
+    // Accumulators are rooted at the longest non-wildcard prefix of the
+    // listener path. Wildcards select multiple concrete sub-paths that share
+    // the same parent in the JSON document, so the accumulator must live at
+    // (or above) that parent in order to capture every match.
+    let prefixEnd = path.length;
+    for (let i = 0; i < path.length; i++) {
+      if (path[i] === ANY_INDEX) {
+        prefixEnd = i;
+        break;
+      }
+    }
+    const prefix = path.slice(0, prefixEnd);
 
-    // TODO Remove redundant accumulators.
-    // For now, maintain simple accumulators for every path being listened to.
-    // This may be memory inefficient, but easier to reason about.
+    if (this.accumulators.some((a) => isExactPath(a.path, prefix))) {
+      return;
+    }
+    this.accumulators.push({ path: prefix, partial });
   }
 
   write(str: string, terminate = false) {
@@ -191,14 +238,25 @@ export class JSONListener {
               const current = queryAccumulator(accumulator, event.path);
               setAtPath(accumulator, event.path, current + event.delta);
               break;
+            case "close-key":
+              // Seed the new key with `undefined` so partial readers can see
+              // that the key exists before its value has been parsed. The
+              // value is overwritten as soon as an open-* event for the
+              // value fires.
+              setAtPath(accumulator, event.path, undefined);
+              break;
           }
         }
       }
 
       for (const partialListener of this.partialListeners) {
         if (isParentPath(partialListener.path, event.path)) {
+          const resolvedPath = resolveWildcards(
+            partialListener.path,
+            event.path
+          );
           const accumulator = this.accumulators.find((accumulator) =>
-            isParentPath(accumulator.path, event.path)
+            isParentPath(accumulator.path, resolvedPath)
           );
 
           if (!accumulator) {
@@ -206,8 +264,8 @@ export class JSONListener {
           }
 
           // All events trigger a callback. The exact state of the accumulator
-          const value = queryAccumulator(accumulator, partialListener.path);
-          partialListener.callback(partialListener.path, value);
+          const value = queryAccumulator(accumulator, resolvedPath);
+          partialListener.callback(resolvedPath, value);
         }
       }
 
@@ -249,8 +307,7 @@ export class JSONListener {
       }
 
       for (const completeListener of this.completeListeners) {
-        if (isExactPath(completeListener.path, event.path)) {
-          // Get an accumulator that is a parent of this path.
+        if (matchesPath(completeListener.path, event.path)) {
           const accumulator = this.accumulators.find((accumulator) =>
             isParentPath(accumulator.path, event.path)
           );

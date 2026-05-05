@@ -9,14 +9,6 @@ const ESCAPE_MAP: Record<string, string> = {
   "\\": "\\",
 };
 
-type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | { [x: string]: JsonValue }
-  | JsonValue[];
-
 type JSONState =
   | "open"
   | "value-close"
@@ -82,7 +74,10 @@ export class JSONStateMachine {
         this.state === "string-close" ||
         this.state === "true-close" ||
         this.state === "false-close" ||
-        this.state === "null-close") &&
+        this.state === "null-close" ||
+        // value-close is reached when the root value is followed by
+        // whitespace; trailing whitespace is valid JSON.
+        this.state === "value-close") &&
       this.containerStack.length === 0
     ) {
       // These states support closure, so long as there are no open containers.
@@ -158,18 +153,26 @@ export class JSONStateMachine {
           return "null-open";
         }
 
-        if (char.match(/[-0-9]/)) {
+        if (char === "-") {
+          // A new negative number is opening; a digit MUST follow.
+          // Routed through a distinct state so termination here is rejected.
+          return "number-sign";
+        }
+
+        if (char.match(/[0-9]/)) {
           // A new number is opening.
+          // TODO Handle zero properly: per spec a leading `0` may not be
+          // followed by another digit. Currently `01` parses as 1.
           return "number-integer";
         }
 
-        if (char === "0") {
-          // TODO Handle zero properly. For now, treat it as a valid number when
-          // finding a leading zero.
-          // Zero may start a number, but it cannot be followed by a digit.
-          return "number-integer-zero";
-        }
+        break;
 
+      case "number-sign":
+        // We saw `-`; require a digit to continue the number.
+        if (char.match(/[0-9]/)) {
+          return "number-integer";
+        }
         break;
 
       case "object-open":
@@ -179,7 +182,9 @@ export class JSONStateMachine {
         }
 
         if (char === "}") {
-          // Object is immediately closed.
+          // Object is immediately closed. Mirror the array-open behavior of
+          // popping the container so termination accounting stays correct.
+          this.containerStack.pop();
           return "object-close";
         }
 
@@ -430,7 +435,6 @@ export class JSONStateMachine {
         break;
     }
 
-    debugger;
     throw new Error(`Invalid character at index ${this.index}: ${char}`);
   }
 }
@@ -515,11 +519,16 @@ export class StreamingJSONParser {
   stateMachine = new JSONStateMachine();
   state: JSONState = "open";
   path: (string | number)[] = [];
+  // Snapshots of `path` taken at every open-object/open-array event so the
+  // matching close event can yield at the same path and restore `path`
+  // symmetrically. This handles empty containers — where no key/index was
+  // ever pushed inside — without misattributing the close to the parent's
+  // member.
+  openPathStack: (string | number)[][] = [];
   numberBuffer = "";
   stringBuffer = "";
   unicodeBuffer = "";
   currentKey = "";
-  currentIndex = 0;
 
   *write(str: string, terminate = false) {
     for (const event of this._write(str, terminate)) {
@@ -564,9 +573,14 @@ export class StreamingJSONParser {
           }
           break;
 
-        case "string-escaped-char":
-          this.stringBuffer += ESCAPE_MAP[char];
+        case "string-escaped-char": {
+          const decoded = ESCAPE_MAP[char];
+          this.stringBuffer += decoded;
+          if (this.stateMachine.isInKey) {
+            this.currentKey += decoded;
+          }
           break;
+        }
 
         case "string-escape-unicode-2":
         case "string-escape-unicode-3":
@@ -574,17 +588,31 @@ export class StreamingJSONParser {
           this.unicodeBuffer += char;
           break;
 
-        case "string-escape-unicode-close":
+        case "string-escape-unicode-close": {
           this.unicodeBuffer += char;
-          this.stringBuffer += String.fromCodePoint(
+          const decoded = String.fromCodePoint(
             parseInt(this.unicodeBuffer, 16)
           );
+          this.stringBuffer += decoded;
+          if (this.stateMachine.isInKey) {
+            this.currentKey += decoded;
+          }
           this.unicodeBuffer = "";
+          break;
+        }
+
+        case "number-sign":
+          // `-` opens a number; the digit that follows continues into
+          // `number-integer` and shares the same buffer.
+          yield { type: "open-number", path: [...this.path] };
+          this.numberBuffer += char;
           break;
 
         case "number-integer":
           // First entry into number-integer yields open-number; subsequent
-          // digits in the same state just append.
+          // digits in the same state just append. When entered from
+          // `number-sign` the buffer already holds the sign so we skip
+          // the open-number emit.
           if (!this.numberBuffer) {
             yield { type: "open-number", path: [...this.path] };
           }
@@ -604,8 +632,11 @@ export class StreamingJSONParser {
       // exactly once when the state is *entered*. The state machine returns
       // the same state for whitespace continuations (e.g. `, ` keeps state
       // at "object-comma"); without this guard we would pop/push the path
-      // multiple times and corrupt the event stream.
-      if (this.state === previousState) {
+      // multiple times and corrupt the event stream. We only skip when the
+      // continuation is whitespace — repeated close characters like `}}` or
+      // `]]` legitimately re-enter the same state and must run the
+      // transition again.
+      if (this.state === previousState && /\s/.test(char)) {
         continue;
       }
 
@@ -613,6 +644,7 @@ export class StreamingJSONParser {
         case "object-open":
           // For consistency with other open events, do not include a
           // new key.
+          this.openPathStack.push([...this.path]);
           yield { type: "open-object", path: [...this.path] };
           break;
 
@@ -621,11 +653,12 @@ export class StreamingJSONParser {
           break;
 
         case "object-close":
-          this.path.pop();
+          this.path = this.openPathStack.pop()!;
           yield { type: "close-object", path: [...this.path] };
           break;
 
         case "array-open":
+          this.openPathStack.push([...this.path]);
           yield { type: "open-array", path: [...this.path] };
           this.path.push(0);
           break;
@@ -635,7 +668,7 @@ export class StreamingJSONParser {
           break;
 
         case "array-close":
-          this.path.pop();
+          this.path = this.openPathStack.pop()!;
           yield { type: "close-array", path: [...this.path] };
           break;
 
@@ -671,11 +704,6 @@ export class StreamingJSONParser {
           };
           yield { type: "close-string", path: [...this.path] };
           this.stringBuffer = "";
-          break;
-
-        case "number-sign":
-          this.numberBuffer += char;
-          yield { type: "open-number", path: [...this.path] };
           break;
 
         case "false-open":
